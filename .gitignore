@@ -1,0 +1,19 @@
+# Python
+venv/
+venv-ancien-*
+__pycache__/
+*.pyc
+
+# Gros fichiers - NE JAMAIS PUSH
+*.pcapng
+*.pcap
+*.db
+*.csv
+*.json
+models/
+logs/
+results/
+data/
+!data/geoip_cache.json
+.env
+app/.streamlit/secrets.toml

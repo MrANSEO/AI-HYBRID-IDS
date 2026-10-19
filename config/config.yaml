@@ -1,0 +1,44 @@
+# AI-HYBRID-IDS - Configuration centrale (section 45, 59)
+# Modifie via le dashboard (page Settings) ou directement ici.
+# Un changement necessite un redemarrage de live_detection.py pour s'appliquer
+# (pas de rechargement a chaud) - limite assumee, documentee explicitement.
+
+correlation:
+  window_seconds: 60  # fenetre glissante du Correlation Engine (Phase 12)
+  scan_port_threshold: 10  # ports distincts par source dans la fenetre
+  repeated_attack_threshold: 3  # predictions ML hors Normal
+  flood_packets_per_sec_threshold: 1000  # seuil initial, a calibrer au laboratoire
+  flood_bytes_per_sec_threshold: 1000000  # 1 MB/s, a calibrer au laboratoire
+
+decision_engine:
+  # Poids de la formule du risk_score - voir docs/DECISION_ENGINE.md pour la
+  # justification complete de chaque coefficient (Phase 13).
+  weight_suricata: 0.40
+  weight_ml_confidence: 0.25
+  weight_model_agreement: 0.10
+  weight_anomaly: 0.10
+  weight_correlation: 0.15
+
+  # Seuils de statut
+  threshold_critical: 0.75
+  threshold_attack: 0.45
+  threshold_suspicious: 0.20
+
+  # Facteurs de penalite de confiance ML par classe peu fiable (Phase 8)
+  unreliable_class_factors:
+    "Web Attacks": 0.3
+    "Bots": 0.5
+
+incident_engine:
+  timeout_seconds: 300  # silence au-dela duquel un incident OPEN passe RESOLVED
+
+llm:
+  enabled: true
+  model: "qwen2.5:3b"
+  timeout_seconds: 320
+  max_events_in_prompt: 10
+
+logs:
+  retention_days: 30  # non applique automatiquement pour l'instant (Phase 22)
+
+mode: "live"  # live | replay | offline (section 25) - informatif pour l'instant

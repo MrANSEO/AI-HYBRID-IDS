@@ -1,0 +1,245 @@
+"""
+decision_engine.py
+AI-HYBRID-IDS - Phase 13 (sections 10-11) + Phase 16 (Settings, section 45)
+
+Implemente EXACTEMENT la formule documentee dans DECISION_ENGINE.md.
+Ne jamais modifier les coefficients ici sans mettre a jour ce document en
+parallele (ils doivent rester synchronises).
+
+Les poids/seuils sont charges depuis config/config.yaml (editable via le
+dashboard, page Settings) - AVEC REPLI SUR LES VALEURS PAR DEFAUT si le
+fichier est absent ou invalide, pour que ce module ne plante jamais a
+l'import. Un changement necessite un redemarrage de live_detection.py.
+
+Prend en entree le verdict ML (Phase 11) + les signaux de correlation
+(Phase 12) + la presence/severite d'une alerte Suricata, et produit un
+statut/severite/risk_score documente et traçable (section 10).
+"""
+
+import os
+import sys
+import yaml
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_SCRIPT_DIR, "..", "utils"))
+from paths_utils import get_project_root
+
+_CONFIG_PATH = os.path.join(get_project_root(), "config", "config.yaml")
+
+_DEFAULTS = {
+    "weight_suricata": 0.40,
+    "weight_ml_confidence": 0.25,
+    "weight_model_agreement": 0.10,
+    "weight_anomaly": 0.10,
+    "weight_correlation": 0.15,
+    "threshold_critical": 0.75,
+    "threshold_attack": 0.45,
+    "threshold_suspicious": 0.20,
+    "unreliable_class_factors": {"Web Attacks": 0.3, "Bots": 0.5},
+}
+
+
+def _load_config():
+    """Charge config.yaml -> section decision_engine, repli sur _DEFAULTS
+    si le fichier est absent, invalide, ou si une cle manque."""
+    cfg = dict(_DEFAULTS)
+    if os.path.exists(_CONFIG_PATH):
+        try:
+            with open(_CONFIG_PATH) as f:
+                loaded = yaml.safe_load(f) or {}
+            cfg.update(loaded.get("decision_engine", {}))
+        except Exception:
+            pass  # config corrompue -> on garde les defauts, le systeme continue
+    return cfg
+
+
+_cfg = _load_config()
+
+# Facteurs d'ajustement de confiance ML par classe - Justification: Phase 8,
+# precision mesuree tres faible sur ces classes malgre une confiance affichee
+# potentiellement haute (voir DECISION_ENGINE.md)
+UNRELIABLE_CLASS_FACTORS = _cfg["unreliable_class_factors"]
+
+# Poids de la formule - synchronises avec DECISION_ENGINE.md et config.yaml
+WEIGHT_SURICATA = _cfg["weight_suricata"]
+WEIGHT_ML_CONFIDENCE = _cfg["weight_ml_confidence"]
+WEIGHT_MODEL_AGREEMENT = _cfg["weight_model_agreement"]
+WEIGHT_ANOMALY = _cfg["weight_anomaly"]
+WEIGHT_CORRELATION = _cfg["weight_correlation"]
+
+# Seuils de statut - synchronises avec DECISION_ENGINE.md et config.yaml
+THRESHOLD_CRITICAL = _cfg["threshold_critical"]
+THRESHOLD_ATTACK = _cfg["threshold_attack"]
+THRESHOLD_SUSPICIOUS = _cfg["threshold_suspicious"]
+
+STRONG_CORRELATION_SIGNALS = (
+    "REPEATED_ML_ATTACK_PREDICTION",
+    "POSSIBLE_SCAN",
+    "POSSIBLE_FLOOD",
+    "SURICATA_ML_CONVERGENCE",
+)
+
+# Pondération de la severite d'une alerte Suricata (ajoute le 06/09/2026 suite
+# a un test reel ayant revele qu'une alerte de decodage protocolaire mineure
+# (STREAM, gid=1, pas de metadata signature_severity) declenchait a tort un
+# statut ATTACK au meme titre qu'une vraie signature de menace.
+SEVERITY_TEXT_WEIGHTS = {
+    "informational": 0.3,
+    "minor": 0.5,
+    "major": 0.8,
+    "critical": 1.0,
+}
+
+# Categories observees empiriquement (05-06/09/2026) comme correspondant a des
+# anomalies reseau/protocolaires benignes plutot qu'a de vraies signatures de
+# menace, quand aucun texte signature_severity n'est fourni par la regle.
+# LISTE PARTIELLE - a enrichir au fur et a mesure des alertes reelles
+# observees (Phase 26, laboratoire de test).
+LOW_SEVERITY_FALLBACK_CATEGORIES = {
+    "generic protocol command decode",
+}
+
+DEFAULT_SEVERITY_WEIGHT_UNKNOWN = 0.6  # jamais 0 (Regle 7) mais pas non plus 1.0 par defaut
+
+
+def compute_suricata_severity_weight(signature_severity_text, category):
+    """
+    Calcule un poids de gravite [0,1] pour une alerte Suricata, en utilisant
+    en priorite le texte metadata.signature_severity, puis un repli par
+    categorie pour les alertes moteur interne qui n'ont pas cette metadata.
+    """
+    if signature_severity_text:
+        key = signature_severity_text.strip().lower()
+        if key in SEVERITY_TEXT_WEIGHTS:
+            return SEVERITY_TEXT_WEIGHTS[key]
+
+    if category:
+        key = category.strip().lower()
+        if key in LOW_SEVERITY_FALLBACK_CATEGORIES:
+            return 0.3
+
+    return DEFAULT_SEVERITY_WEIGHT_UNKNOWN
+
+
+def compute_ml_confidence_adjusted(predicted_class, raw_confidence):
+    """Confiance ML, penalisee sur les classes a faible fiabilite reelle (Phase 8)."""
+    if predicted_class == "Normal Traffic":
+        return 0.0  # pas de "risque" associe a une prediction Normal
+    factor = UNRELIABLE_CLASS_FACTORS.get(predicted_class, 1.0)
+    return raw_confidence * factor
+
+
+def compute_model_agreement_score(model_agreement_str):
+    """'3/3' -> 1.0, '2/3' -> 0.5, '1/3' -> 0.0"""
+    try:
+        num, denom = map(int, model_agreement_str.split("/"))
+    except (ValueError, AttributeError):
+        return 0.0
+    if denom == 0:
+        return 0.0
+    ratio = num / denom
+    if ratio == 1.0:
+        return 1.0
+    elif ratio > 0.5:
+        return 0.5
+    return 0.0
+
+
+def compute_correlation_signal_score(correlation_signals):
+    """1.0 si un signal fort (section DECISION_ENGINE.md) est present, sinon 0.0."""
+    for signal in correlation_signals:
+        if any(signal.startswith(strong) for strong in STRONG_CORRELATION_SIGNALS):
+            return 1.0
+    return 0.0
+
+
+def compute_risk_score(predicted_class, ml_confidence, model_agreement_str,
+                        is_anomaly, suricata_severity_weight, correlation_signals):
+    """
+    Calcule le risk_score compose selon la formule documentee (DECISION_ENGINE.md).
+    suricata_severity_weight: 0.0 si pas d'alerte, sinon poids [0.3-1.0] selon
+    la gravite estimee (voir compute_suricata_severity_weight).
+    """
+    ml_conf_adj = compute_ml_confidence_adjusted(predicted_class, ml_confidence)
+    agreement_score = compute_model_agreement_score(model_agreement_str)
+    anomaly_component = 1.0 if is_anomaly else 0.0
+    correlation_component = compute_correlation_signal_score(correlation_signals)
+
+    risk_score = (
+        WEIGHT_SURICATA * suricata_severity_weight
+        + WEIGHT_ML_CONFIDENCE * ml_conf_adj
+        + WEIGHT_MODEL_AGREEMENT * agreement_score
+        + WEIGHT_ANOMALY * anomaly_component
+        + WEIGHT_CORRELATION * correlation_component
+    )
+
+    breakdown = {
+        "suricata_severity_weight": suricata_severity_weight,
+        "ml_confidence_adjusted": round(ml_conf_adj, 4),
+        "model_agreement_score": agreement_score,
+        "anomaly_component": anomaly_component,
+        "correlation_component": correlation_component,
+    }
+
+    return round(min(risk_score, 1.0), 4), breakdown
+
+
+def determine_status(risk_score, has_suricata_alert, model_agreement_str, correlation_signals):
+    """
+    Applique les seuils + les regles absolues (overrides) documentees dans
+    DECISION_ENGINE.md.
+    """
+    if risk_score >= THRESHOLD_CRITICAL:
+        status = "CRITICAL"
+    elif risk_score >= THRESHOLD_ATTACK:
+        status = "ATTACK"
+    elif risk_score >= THRESHOLD_SUSPICIOUS:
+        status = "SUSPICIOUS"
+    else:
+        status = "NORMAL"
+
+    # Regle absolue 1 (section 9, Regle 7): une alerte Suricata (quelle que
+    # soit sa gravite estimee) ne peut jamais aboutir a un statut NORMAL -
+    # garantit une visibilite minimale meme pour une alerte de faible poids.
+    if has_suricata_alert and status == "NORMAL":
+        status = "SUSPICIOUS"
+
+    # Regle absolue 2 (section 10): desaccord total sans autre signal fort -> UNKNOWN
+    agreement_score = compute_model_agreement_score(model_agreement_str)
+    has_strong_correlation = compute_correlation_signal_score(correlation_signals) > 0
+    if agreement_score == 0.0 and not has_suricata_alert and not has_strong_correlation:
+        status = "UNKNOWN"
+
+    return status
+
+
+def evaluate(predicted_class, ml_confidence, model_agreement_str, is_anomaly,
+             has_suricata_alert, correlation_signals,
+             suricata_signature_severity_text=None, suricata_category=None):
+    """
+    Point d'entree principal du Decision Engine.
+    Retourne un dict conforme aux champs minimaux de la section 10.
+    """
+    suricata_severity_weight = (
+        compute_suricata_severity_weight(suricata_signature_severity_text, suricata_category)
+        if has_suricata_alert else 0.0
+    )
+
+    risk_score, breakdown = compute_risk_score(
+        predicted_class, ml_confidence, model_agreement_str,
+        is_anomaly, suricata_severity_weight, correlation_signals,
+    )
+    status = determine_status(risk_score, has_suricata_alert, model_agreement_str, correlation_signals)
+
+    return {
+        "status": status,
+        "risk_score": risk_score,
+        "attack_type": predicted_class if predicted_class != "Normal Traffic" else None,
+        "confidence": ml_confidence,
+        "anomaly_score": is_anomaly,
+        "suricata_evidence": has_suricata_alert,
+        "suricata_severity_weight": suricata_severity_weight,
+        "model_agreement": model_agreement_str,
+        "correlation_signals": correlation_signals,
+        "risk_score_breakdown": breakdown,
+    }
